@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  discord-slack-relay:
+    build: .
+    container_name: discord-slack-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./channels.json:/app/channels.json:ro

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "<Channel_Name1>",
+    "discordChannelId": "<Discord_Channel_ID>",
+    "slackChannelId": "<Slack_Channel_ID>"
+  },
+  {
+    "name": "<Channel_Name2>",
+    "discordChannelId": "<Discord_Channel_ID>",
+    "slackChannelId": "<Slack_Channel_ID>"
+  },
+  {
+    "name": "<Channel_Name3>",
+    "discordChannelId": "<Discord_Channel_ID>",
+    "slackChannelId": "<Slack_Channel_ID>"
+  }
+]
