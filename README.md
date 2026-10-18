@@ -27,8 +27,7 @@ A small Node.js bot that mirrors messages both ways between paired Discord and S
 | `channels.json` | Discord ↔ Slack channel pairs |
 | `env.example` | Template for `.env` (tokens) |
 | `Dockerfile` / `docker-compose.yml` | Container build and run |
-| `index.js.bak` | Older version that set a custom Slack username and avatar (needed `chat:write.customize`) |
-| `gitignore` | Ignores `node_modules/` and `.env`. It has to be renamed to `.gitignore` to take effect. |
+| `.gitignore` | Ignores `node_modules/` and `.env` |
 
 ## Channel mapping
 

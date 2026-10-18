@@ -1,7 +1,7 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
-const { Client, GatewayIntentBits, Partials, WebhookClient } = require("discord.js");
+const { Client, GatewayIntentBits, WebhookClient } = require("discord.js");
 const { App, LogLevel } = require("@slack/bolt");
 
 // ---------------------------------------------------------------------------
@@ -27,11 +27,18 @@ const DISCORD_TO_SLACK = new Map(); // discordChannelId -> slackChannelId
 const SLACK_TO_DISCORD = new Map(); // slackChannelId -> discordChannelId
 
 for (const c of CHANNELS) {
+  if (!c.discordChannelId || !c.slackChannelId) {
+    console.warn(`Skipping channel mapping "${c.name}" — missing ID fields.`);
+    continue;
+  }
   if (c.discordChannelId.startsWith("<") || c.slackChannelId.startsWith("<")) {
     console.warn(
       `Skipping channel mapping "${c.name}" — placeholder not filled in yet.`
     );
     continue;
+  }
+  if (DISCORD_TO_SLACK.has(c.discordChannelId) || SLACK_TO_DISCORD.has(c.slackChannelId)) {
+    console.warn(`Duplicate channel ID in mapping "${c.name}" — overwriting previous entry.`);
   }
   DISCORD_TO_SLACK.set(c.discordChannelId, c.slackChannelId);
   SLACK_TO_DISCORD.set(c.slackChannelId, c.discordChannelId);
@@ -43,8 +50,18 @@ console.log(`Loaded ${DISCORD_TO_SLACK.size} channel mapping(s).`);
 // real Slack sender's name/avatar instead of the bot's own identity.
 const webhookCache = new Map(); // discordChannelId -> WebhookClient
 
-// Simple cache of Slack user info so we don't re-fetch on every message.
-const slackUserCache = new Map(); // slackUserId -> { name, image }
+// Cache of Slack user info with a 1-hour TTL so name/avatar changes take effect.
+const slackUserCache = new Map(); // slackUserId -> { name, image, cachedAt }
+const SLACK_USER_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+// Escape Slack mrkdwn characters that trigger mentions or link parsing.
+function escapeSlack(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Discord webhook limits.
+const DISCORD_USERNAME_MAX = 80;
+const DISCORD_CONTENT_MAX = 2000;
 
 // ---------------------------------------------------------------------------
 // Discord client
@@ -54,10 +71,8 @@ const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildWebhooks,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel],
 });
 
 async function getOrCreateWebhook(channelId) {
@@ -77,6 +92,12 @@ async function getOrCreateWebhook(channelId) {
       reason: "Relay messages from Slack",
     });
     console.log(`Created webhook for Discord channel ${channelId}`);
+  }
+
+  if (!webhook.token) {
+    throw new Error(
+      `Webhook "slack-bridge" in channel ${channelId} has no token — it was created by another app and cannot be used.`
+    );
   }
 
   const client = new WebhookClient({ id: webhook.id, token: webhook.token });
@@ -111,11 +132,9 @@ discord.on("messageCreate", async (message) => {
 
     if (!body.trim()) return;
 
-    // We don't rely on chat:write.customize (username/icon_url overrides) —
-    // it's not always available/approved on every workspace. Instead we
-    // prefix the real sender's name directly in the message text, which
-    // only needs the base chat:write scope and always works.
-    const text = `*${displayName} (Discord):* ${body}`;
+    // Escape < > & to prevent Discord text from injecting Slack mentions
+    // (<!channel>, <!here>, <@U…>) when relayed via chat.postMessage.
+    const text = `*${escapeSlack(displayName)} (Discord):* ${escapeSlack(body)}`;
 
     await slackApp.client.chat.postMessage({
       channel: slackChannelId,
@@ -140,23 +159,29 @@ const slackApp = new App({
 let slackBotUserId = null;
 
 async function getSlackUserInfo(userId) {
-  if (slackUserCache.has(userId)) return slackUserCache.get(userId);
+  const cached = slackUserCache.get(userId);
+  if (cached && Date.now() - cached.cachedAt < SLACK_USER_CACHE_TTL) {
+    return { name: cached.name, image: cached.image };
+  }
 
   const info = await slackApp.client.users.info({ user: userId });
   const profile = info.user?.profile || {};
   const result = {
     name: profile.display_name || profile.real_name || info.user?.name || "Slack user",
     image: profile.image_72 || profile.image_48 || null,
+    cachedAt: Date.now(),
   };
   slackUserCache.set(userId, result);
   return result;
 }
 
-slackApp.message(async ({ message, client }) => {
+slackApp.message(async ({ message }) => {
   try {
     // Ignore anything that isn't a plain user message (bot messages, edits,
     // deletes, thread broadcasts metadata, etc.) and anything from this bot
     // itself, to avoid echo loops.
+    // The relay's own chat.postMessage calls arrive with subtype "bot_message",
+    // so they are caught by the subtype check even before slackBotUserId is set.
     if (message.subtype) return;
     if (!("user" in message) || !message.user) return;
     if (slackBotUserId && message.user === slackBotUserId) return;
@@ -168,13 +193,36 @@ slackApp.message(async ({ message, client }) => {
     if (!text.trim()) return;
 
     const userInfo = await getSlackUserInfo(message.user);
-    const webhook = await getOrCreateWebhook(discordChannelId);
 
-    await webhook.send({
-      content: text,
-      username: `${userInfo.name} (Slack)`,
+    // Discord caps webhook usernames at 80 characters and content at 2000.
+    const username = `${userInfo.name} (Slack)`.slice(0, DISCORD_USERNAME_MAX);
+    const content =
+      text.length > DISCORD_CONTENT_MAX
+        ? `${text.slice(0, DISCORD_CONTENT_MAX - 1)}…`
+        : text;
+
+    const sendPayload = {
+      content,
+      username,
       avatarURL: userInfo.image || undefined,
-    });
+      // Suppress all mention parsing so Slack @-mentions don't ping Discord users.
+      allowedMentions: { parse: [] },
+    };
+
+    let webhook = await getOrCreateWebhook(discordChannelId);
+    try {
+      await webhook.send(sendPayload);
+    } catch (err) {
+      // Discord error 10015 = Unknown Webhook (deleted externally). Drop the
+      // cache entry and retry once with a fresh webhook.
+      if (err.code === 10015) {
+        webhookCache.delete(discordChannelId);
+        webhook = await getOrCreateWebhook(discordChannelId);
+        await webhook.send(sendPayload);
+      } else {
+        throw err;
+      }
+    }
   } catch (err) {
     console.error("Error relaying Slack -> Discord:", err);
   }
@@ -187,9 +235,14 @@ slackApp.message(async ({ message, client }) => {
 (async () => {
   await discord.login(DISCORD_TOKEN);
 
-  await slackApp.start();
+  // Resolve the bot's own Slack user ID before starting the listener so the
+  // loop-prevention check is never racing against incoming messages.
+  // (Bot messages also carry subtype "bot_message" and are filtered there,
+  // but having the user ID set immediately makes the guard fully reliable.)
   const auth = await slackApp.client.auth.test();
   slackBotUserId = auth.user_id;
+
+  await slackApp.start();
   console.log(`Slack connected as ${auth.user} (${slackBotUserId}) via Socket Mode`);
 
   console.log("Relay is running.");
